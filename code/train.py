@@ -3,17 +3,16 @@ from functools import partial
 from ml_collections import ConfigDict, config_flags
 
 from models.utils import sample_gaussian
-from dataset_utils import get_dataset, get_dataloader
-from utils import get_data_config, prepare_test_dataset
+from dataset_utils import get_dataset, get_dataloader, split_dataset
+from utils import get_classifier, get_data_config, get_dtype, prepare_test_dataset
 from optimiser import get_optimiser
 from jax import random
+import jax.numpy as jnp
 from jax.nn import one_hot
 from flax.training import train_state
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from tqdm import tqdm
 import orbax.checkpoint as ocp
-
-import models.ClassifierGFZ as ClassifierGFZ
-import models.ClassifierDFZ as ClassifierDFZ
 
 from absl import app
 from absl import flags
@@ -21,68 +20,66 @@ from pathlib import Path
 
 CHECKPOINT_DIR = Path.cwd() / Path("checkpoints")
 
+def train_and_evaluate(flags):
+    config = flags.config
 
-def train_and_evaluate(config: ConfigDict):
-    checkpointer = None
+    dtype = get_dtype(config.dtype)
+
     if config.checkpoint:
         checkpointer = ocp.PyTreeCheckpointer()
 
-    train_ds, test_ds = get_dataset(config.dataset)
-    train_dl = get_dataloader(train_ds, config.batch_size)
+    ds = get_dataset(config.dataset, train=True)
+    train_ds, test_ds = split_dataset(ds, [config.n_train, config.n_test], config.train_seed)
 
-    dataset_config = get_data_config(train_ds)
-
-    test_images, test_labels = prepare_test_dataset(
-       test_ds, dataset_config
-    )
+    train_dl = get_dataloader(train_ds, config.train_batch_size, dtype)
+    test_dl = get_dataloader(test_ds, config.test_batch_size, dtype)
     
-    key = random.PRNGKey(config.seed)
+    key = random.PRNGKey(config.train_seed)
 
-    if config.model_name == "GFZ":
-       classifier = ClassifierGFZ
-    elif config.model_name == "DFZ":
-       classifier = ClassifierDFZ
-    else:
-       raise NotImplementedError(config.model_name)
-
-    key, model, init_params = classifier.create_and_init(
-       key, config, dataset_config
-    )
+    classifier = get_classifier(config)
+    model_config = classifier.create_model_config(config)
+    key, init_params = classifier.init_params(key, model_config, dtype)
 
     optimiser = get_optimiser(config)
 
-    training_state = train_state.TrainState.create(
-        apply_fn=partial(model.apply, train=True),
-        params=init_params,
-        tx=optimiser,
-    )
-
+    training_state = classifier.create_training_state(model_config, init_params, optimiser) 
     del init_params # access params only through training_state
 
     # split training/test keys
     key, training_key, dropout_key, test_key = random.split(key, 4)
-
-    #sinks for the metric values
-    training_steps, test_steps = [], []
-    training_loss_values, test_loss_values, test_accuracy_values = [], [], []
-    loss_value, test_loss_value, test_accuracy_value = None, None, None
-
-    epsilon_shape = (config.batch_size, config.model.d_latent)
-
-    log_likelyhood_fn = classifier.log_likelyhood_A
+    
+    epsilon_shape = (config.train_batch_size, config.model.d_latent)
+    log_likelihood_fn = classifier.log_likelihood_A
     loss_fn = classifier.loss_A
     loss_single_fn = classifier.loss_A_single
 
     # training loop
     for epoch in range(1, config.num_epochs+1):
-        with tqdm(train_dl, unit="batch") as tepoch:
-            tepoch.set_description(f"Epoch {epoch}")
-            for train_step, (X_batch, y_batch) in enumerate(tepoch):
+        #sink for the metric values
+        metrics = {
+            "training_steps": [],
+            "test_steps": [],
+            "training_loss": [],
+            "test_loss": [],
+            "test_accuracy": [],
+            "test_f1_score_micro": [],
+            "test_f1_score_macro": [],
+            "test_precision_micro": [],
+            "test_precision_macro": [],
+            "test_recall_micro": [],
+            "test_recall_macro": [],
+            "test_confusion_matrix": None,
+        }
+        with tqdm(train_dl, unit="batch") as train_epoch:
+            train_epoch.set_description(f"Train epoch #{epoch}")
+            for train_step, (X_batch, y_batch) in enumerate(train_epoch):
+                if flags.debug and train_step == 100:
+                    break
                 # one-hot encoding
-                y_batch_one_hot = one_hot(y_batch, dataset_config.n_classes)
+                y_batch_one_hot = one_hot(y_batch, config.n_classes)
                 
                 # sample the prior from gaussian distribution
-                training_key, epsilon = sample_gaussian(training_key, epsilon_shape)
+                training_key, epsilon = sample_gaussian(training_key, epsilon_shape, dtype)
 
                 # training step
                 training_state, loss_value = classifier.training_step(
@@ -90,45 +87,61 @@ def train_and_evaluate(config: ConfigDict):
                 )
                 
                 # log the training loss
-                training_loss_values.append(loss_value)
-                training_steps.append(epoch*config.num_epochs + train_step+1)
+                metrics["training_loss"].append(loss_value)
+                metrics["training_steps"].append(epoch*config.num_epochs + train_step+1)
 
-                tepoch.set_postfix(training_loss=loss_value, test_loss=test_loss_value, test_accuracy=test_accuracy_value)
+                train_epoch.set_postfix(training_loss=loss_value)
+            
+            y_true, y_predictions, test_losses = [], [], []
+            with tqdm(test_dl, unit="batch") as test_epoch:
+                test_epoch.set_description(f"Test epoch #{epoch}")
+                for test_step, (X_batch, y_batch) in enumerate(test_epoch):
+                    if flags.debug and test_step == 2:
+                        break
+                    y_batch_one_hot = one_hot(y_batch, config.n_classes)
 
-            # compute test loss and accuracy
-            test_key, test_loss_value = classifier.compute_batch_loss(
-                test_key, model, training_state.params, test_images, test_labels, loss_fn,
-            )
+                    # compute batch prediction
+                    test_key, y_pred_batch = classifier.make_predictions(
+                        test_key, model_config, training_state.params, log_likelihood_fn, X_batch,
+                    )
+                    y_predictions.append(y_pred_batch)
+                    y_true.append(y_batch)
 
-            test_key, test_accuracy_value = classifier.compute_batch_accuracy(
-                test_key, 
-                model, 
-                training_state.params, 
-                test_images[:100], 
-                test_labels[:100], 
-                log_likelyhood_fn,
-            )
+                    # compute batch loss
+                    test_key, batch_loss = classifier.compute_batch_loss(
+                        test_key, model_config, training_state.params, X_batch, y_batch_one_hot, loss_fn
+                    )
+                    test_losses.append(batch_loss)
 
-            test_loss_values.append(test_loss_value)
-            test_accuracy_values.append(test_accuracy_value)
-            test_steps.append(epoch*config.num_epochs + train_step+1)
+            y_true = jnp.concatenate(y_true)
+            y_predictions = jnp.concatenate(y_predictions)
+            test_losses = jnp.array(test_losses)
 
-            tepoch.set_postfix(
-               training_loss=loss_value, test_loss=test_loss_value, accuracy=test_accuracy_value
-            )
+            metrics["test_steps"].append((epoch-1)*config.num_epochs + train_step+1)
+            metrics["test_accuracy"].append(accuracy_score(y_true, y_predictions))
+            metrics["test_precision_micro"].append(precision_score(y_true, y_predictions, average="micro"))
+            metrics["test_precision_macro"].append(precision_score(y_true, y_predictions, average="macro"))
+            metrics["test_f1_score_micro"].append(f1_score(y_true, y_predictions, average="micro"))
+            metrics["test_f1_score_macro"].append(f1_score(y_true, y_predictions, average="macro"))
+            metrics["test_recall_micro"].append(recall_score(y_true, y_predictions, average="micro"))
+            metrics["test_recall_macro"].append(recall_score(y_true, y_predictions, average="macro"))
+            metrics["test_confusion_matrix"] = confusion_matrix(y_true, y_predictions)
+            metrics["test_loss"].append(jnp.mean(test_losses))
+
+            metric_keys = ["test_loss", "test_accuracy", "test_precision_micro", "test_recall_micro", "test_f1_score_micro"]
+            print(", ".join(f"{key}: {metrics[key][-1]:.3f}" for key in metric_keys))
+
             if config.checkpoint:
+                checkpoint_name = flags.checkpoint_name
+                if checkpoint_name == "":
+                    checkpoint_name = f"{config.checkpoint_name}-{epoch}"
                 checkpointer.save(
-                    CHECKPOINT_DIR / f"{config.checkpoint_name}-{epoch}",
+                    CHECKPOINT_DIR / checkpoint_name,
                     {
-                        "model": model,
-                        "params": training_state.params,
                         "config": config.to_dict(),
-                        "dataset_config": dataset_config.to_dict(),
-                        "training_steps": training_steps,
-                        "test_steps": test_steps,
-                        "training_loss_values": training_loss_values,
-                        "test_loss_values": test_loss_values,
-                        "test_accuracy_values": test_accuracy_values, 
+                        "model_config": model_config,
+                        "params": training_state.params,
+                        "metrics": metrics, 
                     }
                 )
 
@@ -141,8 +154,11 @@ config_flags.DEFINE_config_file(
     lock_config=True,
 )
 
+flags.DEFINE_string("checkpoint_name", "", "folder under checkpoints to save the experiment")
+flags.DEFINE_bool("debug", False, "debug flag")
+
 def main(argv):
-  train_and_evaluate(FLAGS.config)
+  train_and_evaluate(FLAGS)
 
 if __name__ == '__main__':
   app.run(main)
