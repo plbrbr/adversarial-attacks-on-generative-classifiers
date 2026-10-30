@@ -1,4 +1,6 @@
-# Main repo for the Generative Classifiers PGM Project
+# Adversarial Attacks on Generative Classifiers
+
+this work expands from the paper titled "Are Generative Classifiers More Robust to Adversarial Attacks?" (https://proceedings.mlr.press/v97/li19a/li19a.pdf).
 
 ## Setup requirements
 
